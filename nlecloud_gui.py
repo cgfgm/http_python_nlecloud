@@ -17,7 +17,8 @@ TOKEN_FILE = "token.json"
 POLL_INTERVAL_SECONDS = 3
 MAX_POINTS_PER_TAG = 60
 DEFAULT_TEMPERATURE_THRESHOLD = 30.0
-TEMPERATURE_TAG_KEYWORDS = ("temp", "temperature", "temper", "温度", "wendu")
+COMMAND_ON_VALUE = 1
+COMMAND_OFF_VALUE = 0
 
 
 class NLECloudClient:
@@ -171,8 +172,8 @@ class NLECloudApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NLECloud 图形化监控")
-        self.geometry("1080x760")
-        self.minsize(920, 640)
+        self.geometry("1180x780")
+        self.minsize(1000, 640)
 
         self.client = NLECloudClient()
         self.message_queue = queue.Queue()
@@ -181,7 +182,8 @@ class NLECloudApp(tk.Tk):
         self.monitor_thread = None
         self.series = {}
         self.latest_rows = {}
-        self.last_auto_command = None
+        self.temperature_controls = []
+        self.next_temperature_control_id = 1
 
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
@@ -231,34 +233,35 @@ class NLECloudApp(tk.Tk):
         self.monitor_button.grid(row=0, column=4, padx=(0, 8))
         ttk.Button(monitor_frame, text="清空图表", command=self.clear_chart).grid(row=0, column=5, padx=(0, 8))
 
-        control_frame = ttk.LabelFrame(root, text="温度自动/手动控制", padding=10)
+        control_frame = ttk.LabelFrame(root, text="温度自动控制", padding=10)
         control_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        control_frame.columnconfigure(10, weight=1)
-        ttk.Label(control_frame, text="温度阈值(℃)").grid(row=0, column=0, padx=(0, 6))
-        temperature_slider = ttk.Scale(
-            control_frame,
-            from_=0,
-            to=100,
-            variable=self.temperature_threshold_var,
-            command=self._on_temperature_threshold_changed,
-            length=220,
-        )
-        temperature_slider.grid(row=0, column=1, padx=(0, 8), sticky="ew")
-        ttk.Label(control_frame, textvariable=self.temperature_threshold_label_var, width=8).grid(row=0, column=2, padx=(0, 16))
-        ttk.Label(control_frame, text="传感器标识名").grid(row=0, column=3, padx=(0, 6))
-        ttk.Entry(control_frame, textvariable=self.actuator_tag_var, width=20).grid(row=0, column=4, padx=(0, 8))
-        ttk.Button(control_frame, text="手动打开", command=lambda: self.manual_control(True)).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(control_frame, text="手动关闭", command=lambda: self.manual_control(False)).grid(row=0, column=6, padx=(0, 12))
-        ttk.Checkbutton(control_frame, text="启用自动控制", variable=self.auto_control_var).grid(row=0, column=7, padx=(0, 12))
-        ttk.Label(control_frame, textvariable=self.control_status_var, foreground="#0969da").grid(
-            row=0, column=10, sticky="e"
-        )
+        control_frame.columnconfigure(0, weight=1)
+        description = "每行可手动拖动温度滑块，或填写温度 ApiTag 后随实时数据自动更新；温度 > 值 时打开传感器标识名，否则关闭。"
+        ttk.Label(control_frame, text=description, foreground="#57606a").grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        ttk.Label(
-            control_frame,
-            text="自动规则：实时温度 > 阈值时打开该标识名，否则关闭；温度从 ApiTag/名称含 temp、temperature、温度、wendu 的数值数据中读取。",
-            foreground="#57606a",
-        ).grid(row=1, column=0, columnspan=11, sticky="w", pady=(8, 0))
+        self.control_rows_frame = ttk.Frame(control_frame)
+        self.control_rows_frame.grid(row=1, column=0, sticky="ew")
+        for idx in range(10):
+            self.control_rows_frame.columnconfigure(idx, weight=0)
+        self.control_rows_frame.columnconfigure(1, weight=1)
+        self.control_rows_frame.columnconfigure(9, weight=1)
+        headers = (
+            "序号",
+            "温度滑块",
+            "当前温度",
+            "+/-",
+            "ApiTag",
+            "值",
+            "传感器标识名",
+            "手动控制",
+            "自动控制",
+            "状态",
+        )
+        for column, text in enumerate(headers):
+            ttk.Label(self.control_rows_frame, text=text, foreground="#57606a").grid(
+                row=0, column=column, padx=(0, 8), sticky="w"
+            )
+        self.add_temperature_control_row()
 
         content = ttk.PanedWindow(root, orient="vertical")
         content.grid(row=3, column=0, sticky="nsew")
@@ -289,6 +292,103 @@ class NLECloudApp(tk.Tk):
 
         content.add(table_frame, weight=1)
         content.add(chart_frame, weight=3)
+
+    def add_temperature_control_row(self):
+        control = {
+            "id": self.next_temperature_control_id,
+            "temperature_var": tk.DoubleVar(value=25.0),
+            "temperature_label_var": tk.StringVar(value="25.0 ℃"),
+            "source_tag_var": tk.StringVar(),
+            "threshold_var": tk.DoubleVar(value=DEFAULT_TEMPERATURE_THRESHOLD),
+            "target_tag_var": tk.StringVar(),
+            "auto_enabled_var": tk.BooleanVar(value=True),
+            "state_var": tk.StringVar(value="自动控制待命"),
+            "last_auto_command": None,
+            "widgets": [],
+        }
+        self.next_temperature_control_id += 1
+
+        row_label = ttk.Label(self.control_rows_frame, width=4)
+        temperature_scale = ttk.Scale(
+            self.control_rows_frame,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            variable=control["temperature_var"],
+            command=lambda value, current=control: self.on_temperature_change(current, value),
+            length=220,
+        )
+        temperature_label = ttk.Label(self.control_rows_frame, textvariable=control["temperature_label_var"], width=8)
+        button_frame = ttk.Frame(self.control_rows_frame)
+        ttk.Button(button_frame, text="+", width=3, command=self.add_temperature_control_row).pack(side="left", padx=(0, 2))
+        ttk.Button(button_frame, text="-", width=3, command=lambda current=control: self.remove_temperature_control_row(current)).pack(
+            side="left"
+        )
+        source_entry = ttk.Entry(self.control_rows_frame, textvariable=control["source_tag_var"], width=14)
+        threshold_spinbox = ttk.Spinbox(
+            self.control_rows_frame,
+            from_=-100,
+            to=200,
+            increment=0.5,
+            textvariable=control["threshold_var"],
+            width=8,
+            command=lambda current=control: self.evaluate_temperature_control(current),
+        )
+        threshold_spinbox.bind("<Return>", lambda event, current=control: self.evaluate_temperature_control(current))
+        threshold_spinbox.bind("<FocusOut>", lambda event, current=control: self.evaluate_temperature_control(current))
+        target_entry = ttk.Entry(self.control_rows_frame, textvariable=control["target_tag_var"], width=16)
+        manual_frame = ttk.Frame(self.control_rows_frame)
+        ttk.Button(manual_frame, text="手动打开", command=lambda current=control: self.send_control_command(current, True, manual=True)).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(manual_frame, text="手动关闭", command=lambda current=control: self.send_control_command(current, False, manual=True)).pack(
+            side="left"
+        )
+        auto_check = ttk.Checkbutton(
+            self.control_rows_frame,
+            text="自动控制",
+            variable=control["auto_enabled_var"],
+            command=lambda current=control: self.evaluate_temperature_control(current),
+        )
+        state_label = ttk.Label(self.control_rows_frame, textvariable=control["state_var"], foreground="#57606a")
+        control["widgets"] = [
+            row_label,
+            temperature_scale,
+            temperature_label,
+            button_frame,
+            source_entry,
+            threshold_spinbox,
+            target_entry,
+            manual_frame,
+            auto_check,
+            state_label,
+        ]
+        self.temperature_controls.append(control)
+        self._refresh_temperature_control_rows()
+        return control
+
+    def remove_temperature_control_row(self, control):
+        if len(self.temperature_controls) <= 1:
+            control["state_var"].set("至少保留一条控制规则")
+            return
+        if control not in self.temperature_controls:
+            return
+        self.temperature_controls.remove(control)
+        for widget in control["widgets"]:
+            widget.destroy()
+        self._refresh_temperature_control_rows()
+
+    def _refresh_temperature_control_rows(self):
+        for row_index, control in enumerate(self.temperature_controls, start=1):
+            for column, widget in enumerate(control["widgets"]):
+                widget.grid(row=row_index, column=column, padx=(0, 8), pady=(2, 2), sticky="ew")
+            control["widgets"][0].configure(text=str(row_index))
+
+    def _find_temperature_control(self, control_id):
+        for control in self.temperature_controls:
+            if control["id"] == control_id:
+                return control
+        return None
 
     def _load_saved_token(self):
         try:
@@ -331,6 +431,70 @@ class NLECloudApp(tk.Tk):
             self.stop_monitor()
         else:
             self.start_monitor()
+
+    def on_temperature_change(self, control, value):
+        temperature = float(value)
+        control["temperature_label_var"].set(f"{temperature:.1f} ℃")
+        self.evaluate_temperature_control(control)
+
+    def evaluate_temperature_control(self, control):
+        if not control["auto_enabled_var"].get():
+            control["state_var"].set("自动控制已关闭")
+            return
+        try:
+            threshold = float(control["threshold_var"].get())
+        except (TypeError, ValueError, tk.TclError):
+            control["state_var"].set("值无效")
+            return
+        should_open = float(control["temperature_var"].get()) > threshold
+        if control["last_auto_command"] == should_open:
+            state_text = "打开" if should_open else "关闭"
+            operator = ">" if should_open else "≤"
+            control["state_var"].set(f"自动判断：温度{operator}值，保持{state_text}")
+            return
+        if self.send_control_command(control, should_open, manual=False):
+            control["last_auto_command"] = should_open
+
+    def send_control_command(self, control, should_open, manual=False):
+        if not self.client.access_token:
+            if manual:
+                messagebox.showwarning("设备控制", "请先登录或读取已保存 Token。")
+            else:
+                control["state_var"].set("自动控制待命：请先登录或读取 Token")
+            return False
+        device_id = self.device_id_var.get().strip()
+        if not device_id:
+            if manual:
+                messagebox.showwarning("设备控制", "请输入设备ID。")
+            else:
+                control["state_var"].set("自动控制待命：请输入设备ID")
+            return False
+        api_tag = control["target_tag_var"].get().strip()
+        if not api_tag:
+            if manual:
+                messagebox.showwarning("设备控制", "请输入要控制的传感器标识名。")
+            else:
+                control["state_var"].set("自动控制待命：请输入传感器标识名")
+            return False
+        value = COMMAND_ON_VALUE if should_open else COMMAND_OFF_VALUE
+        action = "打开" if should_open else "关闭"
+        source = "手动" if manual else "自动"
+        control["state_var"].set(f"{source}正在{action} {api_tag} ...")
+        threading.Thread(
+            target=self._command_worker,
+            args=(control["id"], device_id, api_tag, value, action, source),
+            daemon=True,
+        ).start()
+        return True
+
+    def _command_worker(self, control_id, device_id, api_tag, value, action, source):
+        try:
+            data = self.client.send_command(device_id, api_tag, value)
+            if data.get("Status") not in (0, None):
+                raise RuntimeError(str(data.get("Msg", "未知错误")))
+            self.message_queue.put(("command_ok", (control_id, f"{source}{action} {api_tag} 成功")))
+        except (urllib.error.URLError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.message_queue.put(("command_error", (control_id, f"{source}{action} {api_tag} 失败：{exc}")))
 
     def start_monitor(self):
         if not self.client.access_token:
@@ -380,10 +544,18 @@ class NLECloudApp(tk.Tk):
             elif event == "monitor_stopped":
                 self.monitor_button.configure(text="开始监控")
             elif event == "command_ok":
-                self.control_status_var.set(payload)
+                control_id, message = payload
+                control = self._find_temperature_control(control_id)
+                if control:
+                    control["state_var"].set(message)
+                self.status_var.set(message)
             elif event == "command_error":
-                self.last_auto_command = None
-                self.control_status_var.set(payload)
+                control_id, message = payload
+                control = self._find_temperature_control(control_id)
+                if control:
+                    control["state_var"].set(message)
+                self.status_var.set(message)
+                messagebox.showerror("设备控制", message)
             elif event == "error":
                 self.status_var.set(payload)
                 messagebox.showerror("错误", payload)
@@ -410,93 +582,26 @@ class NLECloudApp(tk.Tk):
                     self.tree.insert("", "end", iid=row_id, values=values)
                     self.latest_rows[row_id] = True
                 self._append_chart_point(tag, value, record_time)
+                self._sync_temperature_controls_from_realtime(tag, value)
                 row_count += 1
         self.chart.set_series(self.series)
         self._run_auto_temperature_control(temperature_value)
         self.status_var.set(f"最新刷新：{time.strftime('%Y-%m-%d %H:%M:%S')}，更新 {row_count} 条数据")
 
-    def _extract_temperature_value(self, devices):
-        for device in devices:
-            for item in device.get("Datas", []):
-                tag = str(item.get("ApiTag", ""))
-                name = str(item.get("Name", ""))
-                searchable = f"{tag} {name}".lower()
-                if any(keyword in searchable for keyword in TEMPERATURE_TAG_KEYWORDS):
-                    try:
-                        return float(item.get("Value", ""))
-                    except (TypeError, ValueError):
-                        continue
-        return None
-
-    def _run_auto_temperature_control(self, temperature_value):
-        if not self.auto_control_var.get():
+    def _sync_temperature_controls_from_realtime(self, tag, value):
+        if not tag:
             return
-        if temperature_value is None:
-            self.control_status_var.set("未找到温度数据，自动控制未执行")
-            return
-        threshold = float(self.temperature_threshold_var.get())
-        should_open = temperature_value > threshold
-        if should_open == self.last_auto_command:
-            self.control_status_var.set(
-                f"自动控制保持{'打开' if should_open else '关闭'}：温度 {temperature_value:.1f}℃，阈值 {threshold:.1f}℃"
-            )
-            return
-        reason = f"自动控制：温度 {temperature_value:.1f}℃ {'>' if should_open else '<='} 阈值 {threshold:.1f}℃"
-        self._send_actuator_command(should_open, reason=reason, show_validation_popup=False)
-
-    def _format_temperature_threshold(self):
-        return f"{float(self.temperature_threshold_var.get()):.1f}℃"
-
-    def _on_temperature_threshold_changed(self, _value=None):
-        self.temperature_threshold_label_var.set(self._format_temperature_threshold())
-        self.last_auto_command = None
-
-    def manual_control(self, open_state):
-        self._send_actuator_command(open_state, reason="手动控制", show_validation_popup=True)
-
-    def _send_actuator_command(self, open_state, reason, show_validation_popup):
-        if not self.client.access_token:
-            self.control_status_var.set("自动控制未执行：请先登录或读取已保存 Token")
-            if show_validation_popup:
-                messagebox.showwarning("执行器控制", "请先登录或读取已保存 Token。")
-            return False
-        device_id = self.device_id_var.get().strip()
-        if not device_id:
-            self.control_status_var.set("自动控制未执行：请输入设备ID")
-            if show_validation_popup:
-                messagebox.showwarning("执行器控制", "请输入设备ID。")
-            return False
-        api_tag = self.actuator_tag_var.get().strip()
-        if not api_tag:
-            self.control_status_var.set("自动控制未执行：请输入要控制的传感器标识名")
-            if show_validation_popup:
-                messagebox.showwarning("执行器控制", "请输入要控制的传感器标识名。")
-            return False
-
-        command_value = 1 if open_state else 0
-        state_text = "打开" if open_state else "关闭"
-        self.control_status_var.set(f"正在{state_text} {api_tag} ...")
-        if reason.startswith("自动控制"):
-            self.last_auto_command = open_state
-        else:
-            self.last_auto_command = None
-        threading.Thread(
-            target=self._command_worker,
-            args=(device_id, api_tag, command_value, reason),
-            daemon=True,
-        ).start()
-        return True
-
-    def _command_worker(self, device_id, api_tag, command_value, reason):
-        with self.command_lock:
+        for control in self.temperature_controls:
+            if control["source_tag_var"].get().strip() != tag:
+                continue
             try:
-                data = self.client.send_command(device_id, api_tag, command_value)
-                if data.get("Status") not in (0, None):
-                    raise RuntimeError(str(data.get("Msg", "未知错误")))
-                state_text = "打开" if command_value == 1 else "关闭"
-                self.message_queue.put(("command_ok", f"{reason}，{api_tag} 已{state_text}"))
-            except (urllib.error.URLError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                self.message_queue.put(("command_error", f"命令发送失败：{exc}"))
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                control["state_var"].set(f"ApiTag {tag} 的值不是数值")
+                continue
+            control["temperature_var"].set(numeric_value)
+            control["temperature_label_var"].set(f"{numeric_value:.1f} ℃")
+            self.evaluate_temperature_control(control)
 
     def _append_chart_point(self, tag, value, record_time):
         if not tag:
