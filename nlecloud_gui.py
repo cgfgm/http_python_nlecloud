@@ -201,6 +201,22 @@ class NLECloudApp(tk.Tk):
         self.after(150, self._process_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _format_temperature_threshold(self, threshold=None):
+        if threshold is None:
+            threshold_var = self.__dict__.get("temperature_threshold_var")
+            if threshold_var is None:
+                threshold = DEFAULT_TEMPERATURE_THRESHOLD
+            else:
+                try:
+                    threshold = threshold_var.get()
+                except tk.TclError:
+                    threshold = DEFAULT_TEMPERATURE_THRESHOLD
+        try:
+            threshold_value = float(threshold)
+        except (TypeError, ValueError):
+            threshold_value = DEFAULT_TEMPERATURE_THRESHOLD
+        return f"{threshold_value:.1f} ℃"
+
     def _build_ui(self):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
